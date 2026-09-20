@@ -7,3 +7,5 @@ logs/
 exports/
 cache/
 .DS_Store
+demo-private/
+qa/

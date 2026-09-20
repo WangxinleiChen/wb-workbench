@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import threading
 import uuid
+import shutil
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -21,13 +22,18 @@ from PIL import Image, ImageDraw, ImageFont
 
 import analysis
 import exports
+import background
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "1.0.0"
+VERSION = "1.1.0-dev"
+APPLICATION = "WBWorkbenchDev"
 ROLES = ("pho", "total")
 MAX_UPLOAD = 65 * 1024 * 1024
-METHOD = ("矩形选区的原始像素积分；局部背景假设近似恒定。暗条带净信号 = "
-          "条带像素数 × 背景均值 − 条带像素和；亮条带取反。R=P净/T净；"
+METHOD = ("两种互斥背景方法，按每张图的正式方法字段选择。模式 A：局部背景框扣除，"
+          "假设局部背景近似恒定；暗条带净信号=条带像素数×背景均值−条带像素和，亮条带取反。"
+          "模式 B：robust-quadratic-v1 背景模型；原灰度 I、背景 B 同原始强度单位，"
+          "暗条带净信号=Σ(B−I)，亮条带=Σ(I−B)，只在条带 ROI 内求和，保留负值且不再减局部背景。"
+          "预览不改变正式结果。R=P净/T净；"
           "相对值=R/本次实验指定对照R的算术均值。双图确认只表示人工复核，不证明实验线性或跨膜可比性。")
 
 
@@ -53,6 +59,8 @@ class Store:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.images_dir = self.directory / "images"
         self.images_dir.mkdir(exist_ok=True)
+        self.derived_dir = self.directory / "derived"
+        self.derived_dir.mkdir(exist_ok=True)
         self.lock = threading.RLock()
         self.path = self.directory / "state.json"
         self.audit_path = self.directory / "audit.jsonl"
@@ -100,6 +108,87 @@ class Store:
             raise ValueError("原图文件缺失，请从备份恢复此分析项目")
         return p
 
+    def background_state(self, exp, role):
+        return exp.get("background", {}).get(role, {"mode": "local", "preview": None, "applied": None})
+
+    def invalidate_background(self, exp, role):
+        if role in exp.get("background", {}):
+            current = exp["background"][role]
+            exp["background"][role] = {"mode": current["mode"], "preview": None, "applied": None}
+
+    def artifact_matches(self, exp, role, artifact):
+        image = exp["images"][role]
+        if not image or not artifact or not exp["settings"][role]["region"]:
+            return False
+        try:
+            key = background.cache_key(image["sha256"], exp["settings"][role]["region"],
+                                       exp["settings"][role]["polarity"], artifact["params"])
+            return (key == artifact["key"] and artifact["algorithm"] == background.ALGORITHM
+                    and artifact["sourceSha256"] == image["sha256"]
+                    and artifact["region"] == exp["settings"][role]["region"]
+                    and artifact["polarity"] == exp["settings"][role]["polarity"])
+        except (KeyError, ValueError):
+            return False
+
+    def process_background(self, exp, role, request):
+        if role not in ROLES:
+            raise ValueError("未知图像角色")
+        old = copy.deepcopy(self.background_state(exp, role))
+        state = copy.deepcopy(old)
+        action = request.get("action")
+        if action == "preview":
+            image = exp["images"][role]
+            region = exp["settings"][role]["region"]
+            polarity = exp["settings"][role]["polarity"]
+            if not image or not region:
+                raise ValueError("请先导入图像并圈定有效分析区域")
+            params = background.validate_params(request.get("params", {}))
+            key = background.cache_key(image["sha256"], region, polarity, params)
+            folder = self.derived_dir / key
+            if folder.exists():
+                artifact = json.loads((folder / "manifest.json").read_text())
+                for name, digest in artifact.get("fileHashes", {}).items():
+                    if Path(name).name != name or hashlib.sha256((folder / name).read_bytes()).hexdigest() != digest:
+                        raise ValueError("派生缓存校验失败，请保留数据并检查文件，未自动覆盖")
+            else:
+                temporary = self.derived_dir / (".pending-" + uuid.uuid4().hex)
+                temporary.mkdir()
+                try:
+                    artifact = background.create_artifact(self.image_path(image), region, polarity, params, temporary)
+                    artifact.update(key=key, createdAt=now(),
+                                    backgroundUrl=f"/derived/{key}/background.png",
+                                    correctedUrl=f"/derived/{key}/corrected.png",
+                                    metadataUrl=f"/derived/{key}/manifest.json")
+                    (temporary / "manifest.json").write_bytes(json_bytes(artifact))
+                    os.replace(temporary, folder)
+                finally:
+                    if temporary.exists():
+                        shutil.rmtree(temporary)
+            if not self.artifact_matches(exp, role, artifact):
+                raise ValueError("派生结果与当前输入不一致")
+            state["preview"] = artifact
+            label = "背景模型预览（正式方法未改变）"
+        elif action == "apply":
+            artifact = state.get("preview")
+            if not self.artifact_matches(exp, role, artifact) or request.get("key") != artifact["key"]:
+                raise ValueError("预览已失效或参数不匹配，请重新生成预览")
+            if state["mode"] != "model" or (state.get("applied") or {}).get("key") != artifact["key"]:
+                for roi in exp["rois"][role]:
+                    roi["confirmed"] = False
+            state.update(mode="model", applied=copy.deepcopy(artifact))
+            label = "应用背景模型（需要重新确认）"
+        elif action == "restore":
+            if state["mode"] != "local":
+                for roi in exp["rois"][role]:
+                    roi["confirmed"] = False
+            state.update(mode="local", applied=None)
+            label = "恢复局部背景框方法（需要重新确认）"
+        else:
+            raise ValueError("背景操作应为 preview、apply 或 restore")
+        exp.setdefault("background", {})[role] = state
+        self.persist(label, exp, {"role": role, "before": old, "after": state})
+        return exp
+
     def upload(self, exp, role, filename, payload):
         if role not in ROLES:
             raise ValueError("未知图像角色")
@@ -129,6 +218,7 @@ class Store:
         exp["images"][role] = image
         exp["rois"][role] = []
         exp["settings"][role]["region"] = None
+        self.invalidate_background(exp, role)
         self.persist("导入图像", exp, {"role": role, "previousImage": before, "image": image})
         return exp
 
@@ -181,16 +271,19 @@ class Store:
                 band = analysis.validate_rect(roi["band"], image["width"], image["height"])
                 background = analysis.validate_rect(roi["background"], image["width"], image["height"])
                 old = old_rois.get(sid)
-                changed = not old or old["band"] != band or old["background"] != background
+                changed = (not old or old["band"] != band or
+                           (self.background_state(exp, role)["mode"] == "local" and old["background"] != background))
                 confirmed = bool(roi.get("confirmed")) and not (changed or settings_changed or sid not in old_sample_ids)
                 rois.append({"sampleId": sid, "band": band, "background": background, "confirmed": confirmed,
                              **({"suggestionNote": roi["suggestionNote"]} if roi.get("suggestionNote") else {})})
             candidate["rois"][role] = rois
             candidate["settings"][role] = clean_setting
-        previous = {k: copy.deepcopy(exp[k]) for k in ("name", "notes", "samples", "settings", "rois")}
+            if settings_changed:
+                self.invalidate_background(candidate, role)
+        previous = {k: copy.deepcopy(exp.get(k)) for k in ("name", "notes", "samples", "settings", "rois", "background")}
         exp.update(candidate)
         self.persist("编辑与复核", exp, {"before": previous,
-                                         "after": {k: copy.deepcopy(exp[k]) for k in previous}})
+                                         "after": {k: copy.deepcopy(exp.get(k)) for k in previous}})
         return exp
 
     def suggest(self, exp, role, request):
@@ -202,6 +295,8 @@ class Store:
         if polarity not in ("dark", "bright"):
             raise ValueError("未知条带极性")
         rois = analysis.suggest_rois(self.image_path(image), region, exp["samples"], polarity)
+        if exp["settings"][role] != {"polarity": polarity, "region": region}:
+            self.invalidate_background(exp, role)
         exp["settings"][role] = {"polarity": polarity, "region": region}
         exp["rois"][role] = rois
         self.persist("生成候选选区", exp, {"role": role, "region": region, "polarity": polarity, "rois": rois})
@@ -236,18 +331,36 @@ class Store:
                    "confirmed": False, "status": "等待选区", "warnings": []}
             for role in ROLES:
                 roi, image = maps[role].get(sample["id"]), exp["images"][role]
+                bg = self.background_state(exp, role)
+                row[role + "Method"] = bg["mode"]
+                row[role + "Artifact"] = bg.get("applied") if bg["mode"] == "model" else None
                 row[role + "Roi"], row[role + "Image"], row[role] = roi, image, None
                 if image:
                     row["warnings"].extend(image.get("warnings", []))
                 if roi and image:
-                    measured = analysis.measure_roi(self.image_path(image), roi, exp["settings"][role]["polarity"])
+                    if bg["mode"] == "model":
+                        artifact = bg.get("applied")
+                        if self.artifact_matches(exp, role, artifact):
+                            measured = background.measure_model(self.image_path(image), roi,
+                                                               self.derived_dir / artifact["key"],
+                                                               expected_key=artifact["key"])
+                        else:
+                            measured = {"valid": False, "net": None, "rawSum": None, "area": None,
+                                        "backgroundMean": None, "backgroundArea": None, "endpointCount": None,
+                                        "method": "model", "backgroundContribution": None,
+                                        "warnings": ["背景模型已失效，请重新预览并应用，或恢复原方法。"]}
+                    else:
+                        measured = analysis.measure_roi(self.image_path(image), roi, exp["settings"][role]["polarity"])
+                        measured.update(method="local", backgroundSource="local-rectangle", algorithmVersion=1,
+                                        parameters={}, backgroundContribution=(measured["area"] * measured["backgroundMean"]
+                                        if measured.get("backgroundMean") is not None else None))
                     for other in exp["rois"][role]:
                         if other["sampleId"] == sample["id"]:
                             continue
                         if analysis.rects_overlap(roi["band"], other["band"]):
                             measured["valid"] = False
                             measured["warnings"].append("同图不同样本的条带框重叠，请调整")
-                        if analysis.rects_overlap(roi["background"], other["band"]):
+                        if bg["mode"] == "local" and analysis.rects_overlap(roi["background"], other["band"]):
                             measured["valid"] = False
                             measured["warnings"].append("背景框覆盖其他样本的条带，请调整")
                     row[role] = measured
@@ -377,7 +490,7 @@ class Handler(BaseHTTPRequestHandler):
             path = unquote(url.path)
             parts = path.strip("/").split("/")
             if path == "/api/health":
-                return self.send_data({"ok": True, "application": "WBWorkbench", "version": VERSION,
+                return self.send_data({"ok": True, "application": APPLICATION, "version": VERSION,
                                        "dataDir": str(self.store.directory)})
             with self.store.lock:
                 if path == "/api/state":
@@ -390,7 +503,11 @@ class Handler(BaseHTTPRequestHandler):
                     if not experiments:
                         raise ValueError("尚无实验可导出")
                     payload, content_type, extension = exports.build_export(self.store, experiments, form)
-                    return self.send_data(payload, content_type, filename=f"wb-results-{dt.datetime.now():%Y%m%d-%H%M%S}.{extension}")
+                    filename = f"wb-dev-results-{dt.datetime.now():%Y%m%d-%H%M%S-%f}.{extension}"
+                    export_dir = self.store.directory.parent / "exports"
+                    export_dir.mkdir(exist_ok=True)
+                    (export_dir / filename).write_bytes(payload)
+                    return self.send_data(payload, content_type, filename=filename)
                 if len(parts) >= 4 and parts[:2] == ["api", "experiments"]:
                     exp = self.store.get(parts[2])
                     if parts[3] == "results":
@@ -399,6 +516,15 @@ class Handler(BaseHTTPRequestHandler):
                         return self.send_data({"events": [e for e in self.store.state.get("audit", []) if e["experimentId"] == exp["id"]]})
                     if parts[3] == "annotated" and len(parts) == 5 and parts[4] in ROLES:
                         return self.send_data(self.store.annotated(exp, parts[4]), "image/png")
+            if len(parts) == 3 and parts[0] == "derived":
+                key, file = parts[1:]
+                if (len(key) != 64 or any(c not in "0123456789abcdef" for c in key)
+                        or file not in ("background.png", "corrected.png", "manifest.json")):
+                    raise ValueError("派生图像路径无效")
+                target = self.store.derived_dir / key / file
+                if not target.is_file():
+                    raise KeyError("派生图像不存在")
+                return self.send_data(target.read_bytes(), "image/png" if file.endswith("png") else "application/json; charset=utf-8")
             if len(parts) == 3 and parts[0] == "images":
                 iid, file = parts[1:]
                 if not iid.startswith("img_") or not iid[4:].isalnum() or file not in ("original", "preview.png"):
@@ -448,6 +574,8 @@ class Handler(BaseHTTPRequestHandler):
                         result = self.store.upload(exp, parts[4], request.get("filename", ""), payload)
                     elif method == "POST" and len(parts) == 5 and parts[3] == "suggest":
                         result = self.store.suggest(exp, parts[4], request)
+                    elif method == "POST" and len(parts) == 5 and parts[3] == "background":
+                        result = self.store.process_background(exp, parts[4], request)
                     else:
                         raise KeyError("接口不存在")
                 else:
@@ -459,11 +587,15 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="WB Workbench 本地分析工具")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--data-dir", default=str(ROOT / "data"))
     parser.add_argument("--open", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    if args.port == 8765:
+        parser.error("开发版保留 8765 给标准版，请使用 8766 或其他独立端口")
+    if not Path(args.data_dir).resolve().is_relative_to(ROOT):
+        parser.error("开发服务的数据目录必须位于开发目录内部，禁止连接标准版或其他目录")
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     server.store = Store(args.data_dir)
     server.verbose = args.verbose

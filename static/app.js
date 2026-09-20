@@ -50,16 +50,41 @@
   const uid = () => active()?.id;
   const imageCache = new Map();
   const view = {
-    pho: {zoom:1,panX:0,panY:0,showOverlay:true,kind:'band'},
-    total: {zoom:1,panX:0,panY:0,showOverlay:true,kind:'band'},
+    pho: {zoom:1,panX:0,panY:0,showOverlay:true,kind:'band',source:'original'},
+    total: {zoom:1,panX:0,panY:0,showOverlay:true,kind:'band',source:'original'},
   };
+  const backgroundDrafts = new Map();
   const state = {experiments:[],activeId:null,selectedId:null,results:null,busy:false,error:null,save:'saved',regionRole:null,drag:null,exportScope:'current'};
   const active = () => state.experiments.find(e => e.id === state.activeId);
   const sample = () => active()?.samples.find(s => s.id === state.selectedId);
   const selectedRow = () => state.results?.rows?.find(r => r.sampleId === state.selectedId);
   const roiFor = (role, id = state.selectedId) => active()?.rois?.[role]?.find(r => r.sampleId === id);
-  const storeActive = () => { try { localStorage.setItem('wb-workbench.active', state.activeId || ''); } catch (_) {} };
-  const restoreActive = () => { try { return localStorage.getItem('wb-workbench.active'); } catch (_) { return null; } };
+  const backgroundFor = role => active()?.background?.[role] || {mode:'local',preview:null,applied:null};
+  const backgroundDraft = role => {
+    const key = `${uid()}:${role}`;
+    if (!backgroundDrafts.has(key)) {
+      const bg = backgroundFor(role);
+      backgroundDrafts.set(key, String(bg.preview?.params?.clipSigma ?? bg.applied?.params?.clipSigma ?? 2.5));
+    }
+    return backgroundDrafts.get(key);
+  };
+  const backgroundPreview = role => {
+    const exp = active(), preview = backgroundFor(role).preview;
+    if (!preview || preview.sourceSha256 !== exp?.images?.[role]?.sha256 || preview.polarity !== exp?.settings?.[role]?.polarity) return null;
+    const region = exp.settings[role].region;
+    return region && ['x','y','w','h'].every(k => region[k] === preview.region?.[k]) ? preview : null;
+  };
+  const backgroundView = role => view[role].source !== 'original' && !backgroundPreview(role) ? 'original' : view[role].source;
+  const backgroundCanApply = role => {
+    const preview = backgroundPreview(role), value = Number(backgroundDraft(role)), bg = backgroundFor(role);
+    return !!preview && Number.isFinite(value) && value >= 1 && value <= 6 && value === preview.params?.clipSigma && !(bg.mode === 'model' && bg.applied?.key === preview.key);
+  };
+  const backgroundMethod = role => {
+    const bg = backgroundFor(role);
+    return bg.mode !== 'model' ? 'A · 局部背景框扣除' : bg.applied ? `B · 二次曲面模型（clipSigma ${bg.applied.params.clipSigma}）` : 'B · 背景模型已失效，等待重新应用';
+  };
+  const storeActive = () => { try { localStorage.setItem('wb-workbench-dev.active', state.activeId || ''); } catch (_) {} };
+  const restoreActive = () => { try { return localStorage.getItem('wb-workbench-dev.active'); } catch (_) { return null; } };
   let toastTimer;
   function toast(message, error = false) {
     clearTimeout(toastTimer);
@@ -114,7 +139,7 @@
           state.activeId = result.id;
           state.selectedId = result.samples[0]?.id || null;
           state.regionRole = null;
-          roles.forEach(role => { view[role].zoom = 1; view[role].panX = 0; view[role].panY = 0; });
+          roles.forEach(role => { view[role].zoom = 1; view[role].panX = 0; view[role].panY = 0; view[role].source = 'original'; });
           storeActive();
         }
       }
@@ -151,7 +176,7 @@
     return `<div class="steps">${['导入与配对','定位条带','逐项复核','导出记录'].map((label,i) => `${i ? '<span class="step-line"></span>' : ''}<div class="step ${i < index ? 'done' : i === index ? 'current' : ''}"><span class="step-number">${i < index ? '✓' : i + 1}</span>${label}</div>`).join('')}</div>`;
   };
   function sidebar() {
-    return `<aside class="sidebar"><div class="brand"><div class="brand-mark">${icon('logo')}</div><div><div class="brand-name">WB Workbench</div><div class="brand-sub">LOCAL ANALYSIS / 01</div></div></div>
+    return `<aside class="sidebar"><div class="brand"><div class="brand-mark">${icon('logo')}</div><div><div class="brand-name">WB Workbench</div><div class="brand-sub">DEVELOPMENT / 1.1.0-DEV</div></div></div>
       <div class="sidebar-section-head"><span>实验工作区</span><span class="mono">${String(state.experiments.length).padStart(2,'0')}</span></div>
       <button class="button new-experiment" data-action="new">${icon('plus')}新建实验</button>
       <nav class="experiment-list" aria-label="实验列表">${state.experiments.length ? state.experiments.map(e => `<button class="experiment-item${e.id === uid() ? ' active' : ''}" data-action="select-experiment" data-id="${esc(e.id)}" ${e.id === uid() ? 'aria-current="page"' : ''}>${icon('experiment')}<div><div class="experiment-title">${esc(e.name)}</div><div class="experiment-info">${shortDate(e.createdAt)} <span aria-hidden="true">·</span> ${e.samples.length} 个样本 <span aria-hidden="true">·</span> ${roles.filter(r => e.images[r]).length}/2 图像</div></div></button>`).join('') : '<div class="sidebar-empty">还没有实验记录</div>'}</nav>
@@ -165,14 +190,32 @@
       <div class="empty-visual"><div class="empty-visual-head"><span>成对图像 · 同一样本编号</span><span class="mono">PHOSPHO / TOTAL</span></div><div class="empty-pair"><div class="empty-image">${icon('image')}<span class="empty-image-label">磷酸化蛋白图</span></div><div class="empty-image">${icon('image')}<span class="empty-image-label">对应总蛋白图</span></div></div><div class="empty-visual-foot"><span>TIFF / PNG / JPEG / BMP</span><span>原图留存 · 坐标可追溯 · 本机处理</span></div></div>
       <div class="empty-features"><div class="empty-feature"><div class="empty-feature-number">01 /</div><h3>你指定目标，软件建议位置</h3><p>圈定目标条带区域，自动建议泳道、条带框和背景框。</p></div><div class="empty-feature"><div class="empty-feature-number">02 /</div><h3>确认之后，才发布比值</h3><p>逐项核对配对选区；调整任一测量框后，需要重新确认。</p></div><div class="empty-feature"><div class="empty-feature-number">03 /</div><h3>带着计算依据一起导出</h3><p>Excel、CSV 与标记图像，保留原始来源和实验内对照。</p></div></div></div>`;
   }
+  function backgroundControls(role) {
+    const bg = backgroundFor(role), preview = backgroundPreview(role), draft = backgroundDraft(role), shown = backgroundView(role);
+    const region = active().settings[role].region;
+    const different = preview && bg.mode === 'model' && bg.applied?.key !== preview.key;
+    const fit = preview?.fitStats;
+    const mapping = preview?.display?.[shown];
+    const displayNote = !mapping ? '' : shown === 'background' ? `显示映射：背景 [${formatNumber(mapping.min)}, ${formatNumber(mapping.max)}] 线性映射至 0–255；恒定背景显示为灰色 128。` : `显示映射：零净信号在灰色 128 附近；最大绝对净信号 ${formatNumber(mapping.maxAbs)} 映射至黑/白端点，${preview.polarity === 'dark' ? '正信号更暗、负信号更亮' : '正信号更亮、负信号更暗'}。`;
+    return `<section class="background-controls" aria-label="${roleNames[role]}背景校正"><div class="background-heading"><strong>背景校正</strong><span class="background-active-method${bg.mode === 'model' ? ' model' : ''}">正式定量：${esc(backgroundMethod(role))}</span></div>
+      <div class="background-params"><label for="background-sigma-${role}">二次曲面 · 残差剔除阈值 <span class="mono">clipSigma</span></label><input id="background-sigma-${role}" class="background-sigma" data-role="${role}" type="number" min="1" max="6" step="0.1" value="${esc(draft)}" aria-describedby="background-draft-${role}"><span>× MAD 稳健尺度（1–6，无量纲）</span></div>
+      <div class="background-draft-note" id="background-draft-${role}">${preview ? `最近预览参数：${preview.params.clipSigma}。${Number(draft) !== preview.params.clipSigma ? '输入参数已变化，须重新预览后才能应用。' : '预览只用于查看；正式定量方法见上方。'}` : '当前输入为草稿。圈定分析区域后，先预览再决定是否应用。'}</div>
+      ${fit ? `<div class="background-view-note">最近预览拟合：采样 ${formatNumber(fit.sampleCount)} 点 · 保留 ${formatNumber(fit.retainedFraction * 100)}% · ${formatNumber(fit.iterations)} 次迭代 · ${fit.converged === true ? '已收敛' : fit.converged === false ? '未收敛' : '收敛状态未记录'}</div>${fit.retainedFraction === 1 ? '<div class="background-model-note">未剔除采样点；不代表条带已与背景分离，请检查估计图。</div>' : ''}` : ''}
+      <div class="background-buttons"><button class="button small" data-action="background-preview" data-role="${role}"${region ? '' : ' disabled'}>${icon('eye')}预览</button><button class="button small orange" data-action="background-apply" data-role="${role}"${backgroundCanApply(role) ? '' : ' disabled'}>${icon('check')}应用于定量</button><button class="button small plain" data-action="background-restore" data-role="${role}"${bg.mode === 'model' ? '' : ' disabled'}>${icon('refresh')}恢复原方法</button></div>
+      <div class="background-view-row"><span>仅切换显示</span><div class="segmented" aria-label="${roleNames[role]}显示图像">${[['original','原图'],['background','背景估计'],['corrected','校正预览']].map(([value,label]) => `<button class="${shown === value ? 'active' : ''}" data-action="background-view" data-role="${role}" data-value="${value}"${value !== 'original' && !preview ? ' disabled' : ''}>${label}</button>`).join('')}</div></div>
+      <div class="background-view-note">${shown === 'original' ? '当前显示原图预览；坐标与正式测量使用的原始图像一致。' : `当前显示最近一次${shown === 'background' ? '背景估计' : '背景校正'}预览（clipSigma ${preview.params.clipSigma}）。分析区域外的灰色部分未处理；PNG 映射仅用于显示，定量使用未截断浮点值。<br>${esc(displayNote)}`}${different && shown !== 'original' ? '<br><b>此预览与正式应用的模型不同，结果表仍使用上方正式方法。</b>' : ''}</div>
+      ${bg.mode === 'model' ? `<div class="background-model-note">${bg.applied ? '旧背景框仅保留用于查看和恢复，不参与当前计算，不会再次扣除。' : '分析区域、极性或原图已变化：模型结果不可用。重新预览并应用，或恢复原方法。'}切换正式方法后须重新确认。</div>` : ''}
+      ${preview?.warnings?.length ? `<details class="background-warnings"><summary>背景模型提示（${preview.warnings.length}）</summary><ul>${preview.warnings.map(w => `<li>${esc(w)}</li>`).join('')}</ul></details>` : ''}
+      <details class="background-help"><summary>参数与适用范围</summary><p>在整块分析区域拟合一个二次曲面，以迭代 MAD 残差剔除降低条带对背景拟合的影响；每张图使用同一参数。clipSigma 越小，越多偏离曲面的像素被排除。该方法适合缓慢变化背景；宽条带、密集信号或突变背景可能被误拟合。不是 ImageJ rolling ball。处理区至少 8 × 8 像素、最多 400 万像素；不恢复截图信息或采集饱和。</p></details></section>`;
+  }
   function imageCard(role) {
     const exp = active(), img = exp.images[role], v = view[role];
     const region = exp.settings[role].region;
     const warningList = img?.warnings || [];
     return `<article class="image-card${state.regionRole === role ? ' region-active' : ''}"><div class="image-card-head"><div class="image-role"><span class="role-marker ${role}"></span>${roleNames[role]}<span class="role-short">${role === 'pho' ? 'PHO' : 'TOTAL'}</span></div><div style="display:flex;align-items:center;gap:5px"><span class="image-filename" title="${esc(img?.filename || '')}">${esc(img?.filename || '')}</span><button class="icon-button" data-action="upload" data-role="${role}" aria-label="${img ? '替换' : '上传'}${roleNames[role]}图" title="${img ? '替换图像会清除本图选区' : '上传图像'}">${icon('upload')}</button></div></div>
       ${img ? `<div class="image-card-tools"><div class="tool-actions"><button class="button small ${state.regionRole === role ? 'orange' : 'plain'}" data-action="region" data-role="${role}" title="在图像内拖动，圈定整排目标条带">${icon('crop')}${state.regionRole === role ? '取消圈选' : '圈选区域'}</button><button class="button small soft" data-action="suggest" data-role="${role}"${region ? '' : ' disabled'} title="${region ? '根据实验样本数建议条带与背景框' : '请先圈选目标条带所在区域'}">${icon('suggest')}自动建议</button></div><div class="segmented" aria-label="${roleNames[role]}信号模式"><button class="${exp.settings[role].polarity === 'dark' ? 'active' : ''}" data-action="polarity" data-role="${role}" data-value="dark" title="浅色背景、深色条带">暗条带</button><button class="${exp.settings[role].polarity === 'bright' ? 'active' : ''}" data-action="polarity" data-role="${role}" data-value="bright" title="深色背景、亮色条带">亮条带</button></div></div>
-      <div class="canvas-wrap"><canvas class="image-canvas" data-role="${role}" aria-label="${roleNames[role]}图像与可调整选区；也可在样本检查器输入像素坐标" tabindex="0"></canvas><div class="canvas-hint${state.regionRole === role ? ' drawing' : ''}">${state.regionRole === role ? '拖动圈定整排目标条带 · Esc 取消' : !exp.rois[role]?.length ? '先圈定目标区域，再自动建议' : `${v.showOverlay ? '选区可拖动 · 拖动边角调整大小' : '原图预览 · 选区暂时隐藏'}`}</div><div class="canvas-zoom"><button class="icon-button" data-action="zoom" data-role="${role}" data-value="out" aria-label="缩小">${icon('minus')}</button><span class="zoom-label" id="zoom-${role}">${Math.round(v.zoom * 100)}%</span><button class="icon-button" data-action="zoom" data-role="${role}" data-value="in" aria-label="放大">${icon('plus')}</button><button class="icon-button" data-action="zoom" data-role="${role}" data-value="fit" aria-label="适应画布" title="适应画布">${icon('fit')}</button></div></div>
-      <div class="image-card-foot"><span class="chip">${esc(img.format)} · ${img.bitDepth} bit</span><span class="chip">${img.width} × ${img.height} px</span><span class="chip${exp.rois[role]?.length ? ' green' : ''}">${exp.rois[role]?.length || 0} 个条带框</span><button class="button small plain" style="margin-left:auto;font-size:10px;padding:3px 5px;min-height:21px" data-action="overlay" data-role="${role}">${icon('eye')}${v.showOverlay ? '查看原图' : '显示标记'}</button></div>
+      ${backgroundControls(role)}<div class="canvas-wrap"><canvas class="image-canvas" data-role="${role}" aria-label="${roleNames[role]}图像与可调整选区；也可在样本检查器输入像素坐标" tabindex="0"></canvas><div class="canvas-hint${state.regionRole === role ? ' drawing' : ''}">${state.regionRole === role ? '拖动圈定整排目标条带 · Esc 取消' : !exp.rois[role]?.length ? '先圈定目标区域，再自动建议' : `${v.showOverlay ? '选区可拖动 · 拖动边角调整大小' : '选区暂时隐藏 · 当前视图见上方'}`}</div><div class="canvas-zoom"><button class="icon-button" data-action="zoom" data-role="${role}" data-value="out" aria-label="缩小">${icon('minus')}</button><span class="zoom-label" id="zoom-${role}">${Math.round(v.zoom * 100)}%</span><button class="icon-button" data-action="zoom" data-role="${role}" data-value="in" aria-label="放大">${icon('plus')}</button><button class="icon-button" data-action="zoom" data-role="${role}" data-value="fit" aria-label="适应画布" title="适应画布">${icon('fit')}</button></div></div>
+      <div class="image-card-foot"><span class="chip">${esc(img.format)} · ${img.bitDepth} bit</span><span class="chip">${img.width} × ${img.height} px</span><span class="chip${exp.rois[role]?.length ? ' green' : ''}">${exp.rois[role]?.length || 0} 个条带框</span><button class="button small plain" style="margin-left:auto;font-size:10px;padding:3px 5px;min-height:21px" data-action="overlay" data-role="${role}">${icon('eye')}${v.showOverlay ? '隐藏标记' : '显示标记'}</button></div>
       ${warningList.length ? `<div class="source-warning">${icon('warning')}<span>${esc(warningList[0])}</span></div>${warningList.length > 1 ? `<details class="source-details"><summary>另 ${warningList.length - 1} 条图像来源提示</summary><ul>${warningList.slice(1).map(w => `<li>${esc(w)}</li>`).join('')}</ul></details>` : ''}` : ''}` : `<div class="upload-empty"><div class="upload-icon">${icon('image')}</div><strong>导入${roleNames[role]}图像</strong><p>TIFF、PNG、JPEG 或 BMP<br>原始文件会保留在本机实验记录中</p><button class="button small" data-action="upload" data-role="${role}">${icon('upload')}选择图像</button></div>`}
       <input class="file-input" id="file-${role}" type="file" data-role="${role}" accept=".tif,.tiff,.jpg,.jpeg,.png,.bmp,image/tiff,image/jpeg,image/png,image/bmp"></article>`;
   }
@@ -190,31 +233,31 @@
   }
   function roiEditor(role) {
     const roi = roiFor(role), kind = view[role].kind, measurement = selectedRow()?.[role];
-    return `<details class="roi-editor" open><summary><span>${roleNames[role]} <span class="mono tiny" style="margin-left:4px;color:#a0ac94">${role.toUpperCase()}</span></span></summary>${roi ? `<div class="roi-tabs"><button class="roi-tab${kind === 'band' ? ' active' : ''}" data-action="roi-kind" data-role="${role}" data-value="band">条带框</button><button class="roi-tab background${kind === 'background' ? ' active' : ''}" data-action="roi-kind" data-role="${role}" data-value="background">背景框</button><span class="chip${roi.confirmed ? ' green' : ''}" style="margin-left:auto;font-size:8px">${roi.confirmed ? '已确认' : '待确认'}</span></div><div class="coord-grid">${['x','y','w','h'].map(k => `<div><label for="coord-${role}-${k}">${{x:'X',y:'Y',w:'宽 W',h:'高 H'}[k]}</label><input id="coord-${role}-${k}" class="coord-input" type="number" step="1" min="${k === 'w' || k === 'h' ? '1' : '0'}" value="${roi[kind]?.[k] ?? 0}" data-role="${role}" data-kind="${kind}" data-key="${k}" aria-label="${roleNames[role]}${kind === 'band' ? '条带' : '背景'}${k} 像素"></div>`).join('')}</div><div class="roi-detail-line"><span>背景校正积分信号</span><strong>${formatNumber(measurement?.net)}</strong></div>${measurement && !measurement.valid ? '<div class="result-warnings">测量暂不可用于比值，请检查选区与背景。</div>' : ''}` : '<div class="roi-missing">尚无此样本的选区。<br>在上方图像圈定目标区域，再点击自动建议。</div>'}</details>`;
+    return `<details class="roi-editor" open><summary><span>${roleNames[role]} <span class="mono tiny" style="margin-left:4px;color:#a0ac94">${role.toUpperCase()}</span></span></summary>${roi ? `<div class="roi-tabs"><button class="roi-tab${kind === 'band' ? ' active' : ''}" data-action="roi-kind" data-role="${role}" data-value="band">条带框</button><button class="roi-tab background${kind === 'background' ? ' active' : ''}" data-action="roi-kind" data-role="${role}" data-value="background">背景框</button><span class="chip${roi.confirmed ? ' green' : ''}" style="margin-left:auto;font-size:8px">${roi.confirmed ? '已确认' : '待确认'}</span></div><div class="coord-grid">${['x','y','w','h'].map(k => `<div><label for="coord-${role}-${k}">${{x:'X',y:'Y',w:'宽 W',h:'高 H'}[k]}</label><input id="coord-${role}-${k}" class="coord-input" type="number" step="1" min="${k === 'w' || k === 'h' ? '1' : '0'}" value="${roi[kind]?.[k] ?? 0}" data-role="${role}" data-kind="${kind}" data-key="${k}" aria-label="${roleNames[role]}${kind === 'band' ? '条带' : '背景'}${k} 像素"></div>`).join('')}</div><div class="roi-method-note">${esc(backgroundMethod(role))}${backgroundFor(role).mode === 'model' && kind === 'background' ? '<br>旧背景框不参与当前模型计算。' : ''}</div><div class="roi-detail-line"><span>未截断净信号</span><strong>${formatNumber(measurement?.net)}</strong></div>${measurement && !measurement.valid ? '<div class="result-warnings">测量暂不可用于比值，请检查选区与背景。</div>' : ''}` : '<div class="roi-missing">尚无此样本的选区。<br>在上方图像圈定目标区域，再点击自动建议。</div>'}</details>`;
   }
   function inspector() {
     const exp = active(), s = sample();
     if (!s) return '';
     const hasPair = roles.every(role => roiFor(role)), confirmed = roles.every(role => roiFor(role)?.confirmed);
     const index = exp.samples.findIndex(item => item.id === s.id);
-    return `<aside class="inspector"><div class="inspector-head"><div class="inspector-title">${icon('inspect')}样本检查器</div><div style="display:flex;align-items:center;gap:4px"><button class="icon-button" data-action="sample-prev" aria-label="上一个样本"${index === 0 ? ' disabled' : ''} style="transform:rotate(180deg)">${icon('chevron')}</button><span class="inspector-counter">${String(index+1).padStart(2,'0')} / ${String(exp.samples.length).padStart(2,'0')}</span><button class="icon-button" data-action="sample-next" aria-label="下一个样本"${index >= exp.samples.length-1 ? ' disabled' : ''}>${icon('chevron')}</button></div></div><div class="inspector-content"><div><div class="sample-edit-grid"><div class="field"><label for="sample-name">样本编号</label><input id="sample-name" data-field="name" value="${esc(s.name)}" maxlength="80"></div><div class="field"><label for="sample-group">实验分组</label><input id="sample-group" data-field="group" value="${esc(s.group)}" maxlength="80" list="sample-groups"><datalist id="sample-groups">${[...new Set(['对照组','实验组',...exp.samples.map(i => i.group).filter(Boolean)])].map(g => `<option value="${esc(g)}"></option>`).join('')}</datalist></div></div><label class="check-label"><input type="checkbox" id="sample-control" data-field="control"${s.control ? ' checked' : ''}>将本样本用作本实验对照</label></div>${roles.map(roiEditor).join('')}</div><div class="confirm-area"><button class="button ${confirmed ? 'soft' : 'primary'}" data-action="confirm"${hasPair ? '' : ' disabled'}>${icon('checkCircle')}${confirmed ? '已确认此样本的双图选区' : '确认此样本的双图选区'}</button><div class="confirm-hint">确认配对身份、条带框与背景框。<br>修改选区或信号模式后，需重新确认。</div></div></aside>`;
+    return `<aside class="inspector"><div class="inspector-head"><div class="inspector-title">${icon('inspect')}样本检查器</div><div style="display:flex;align-items:center;gap:4px"><button class="icon-button" data-action="sample-prev" aria-label="上一个样本"${index === 0 ? ' disabled' : ''} style="transform:rotate(180deg)">${icon('chevron')}</button><span class="inspector-counter">${String(index+1).padStart(2,'0')} / ${String(exp.samples.length).padStart(2,'0')}</span><button class="icon-button" data-action="sample-next" aria-label="下一个样本"${index >= exp.samples.length-1 ? ' disabled' : ''}>${icon('chevron')}</button></div></div><div class="inspector-content"><div><div class="sample-edit-grid"><div class="field"><label for="sample-name">样本编号</label><input id="sample-name" data-field="name" value="${esc(s.name)}" maxlength="80"></div><div class="field"><label for="sample-group">实验分组</label><input id="sample-group" data-field="group" value="${esc(s.group)}" maxlength="80" list="sample-groups"><datalist id="sample-groups">${[...new Set(['对照组','实验组',...exp.samples.map(i => i.group).filter(Boolean)])].map(g => `<option value="${esc(g)}"></option>`).join('')}</datalist></div></div><label class="check-label"><input type="checkbox" id="sample-control" data-field="control"${s.control ? ' checked' : ''}>将本样本用作本实验对照</label></div>${roles.map(roiEditor).join('')}</div><div class="confirm-area"><button class="button ${confirmed ? 'soft' : 'primary'}" data-action="confirm"${hasPair ? '' : ' disabled'}>${icon('checkCircle')}${confirmed ? '已确认此样本的双图选区' : '确认此样本的双图选区'}</button><div class="confirm-hint">确认配对身份、条带框与当前背景方法。<br>修改影响计算的选区、参数或方法后，需重新确认。</div></div></aside>`;
   }
   function measurementDetails() {
     const row = selectedRow(), s = sample();
     if (!s) return '';
     return `<details class="details-section" id="measurement-details"><summary><span style="font:inherit;color:inherit">测量与来源明细 · ${esc(s.name)}</span><span>${esc(row?.recordId || '等待测量记录')}${icon('down')}</span></summary><div class="measurement-grid">${roles.map(role => {
       const m = row?.[role], img = active().images[role], roi = roiFor(role);
-      return `<div class="measurement-card"><h3>${roleNames[role]}</h3>${m ? `<div class="measurement-list">${[['条带像素数',m.area],['原始像素和',m.rawSum],['背景像素数',m.backgroundArea],['背景均值',m.backgroundMean],['最小像素值',m.min],['最大像素值',m.max],['端点像素数',m.endpointCount],['净积分信号',m.net]].map(([key,value]) => `<div class="measurement-line"><span>${key}</span><span>${formatNumber(value)}</span></div>`).join('')}</div><div class="result-warnings">${(m.warnings || []).map(w => esc(w)).join('<br>')}</div>` : '<p class="tiny muted">尚无可显示的测量值。</p>'}<div class="audit-fields">图像：${esc(img?.filename || '未导入')}<br>选区状态：${roi?.confirmed ? '已人工确认' : '未确认'}<br>SHA-256：${esc(img?.sha256 || '—')}${img?.originalUrl ? `<br><a href="${esc(img.originalUrl)}" target="_blank" rel="noopener">查看保存的原始图像</a>` : ''}</div></div>`;
+      return `<div class="measurement-card"><h3>${roleNames[role]}</h3>${m ? `<div class="measurement-list">${[['条带像素数',m.area],['原始像素和',m.rawSum],['背景像素数',m.backgroundArea],['背景均值',m.backgroundMean],['扣除背景贡献',m.backgroundContribution],['最小像素值',m.min],['最大像素值',m.max],['端点像素数',m.endpointCount],['净积分信号',m.net]].map(([key,value]) => `<div class="measurement-line"><span>${key}</span><span>${formatNumber(value)}</span></div>`).join('')}</div><div class="result-warnings">${(m.warnings || []).map(w => esc(w)).join('<br>')}</div>` : '<p class="tiny muted">尚无可显示的测量值。</p>'}<div class="audit-fields">正式方法：${esc(backgroundMethod(role))}<br>背景来源：${esc(m?.backgroundSource || (backgroundFor(role).mode === 'model' ? '模型未就绪' : 'local-rectangle'))}<br>算法版本：${esc(m?.algorithmVersion ?? backgroundFor(role).applied?.algorithmVersion ?? 1)}<br>正式参数：${esc(JSON.stringify(backgroundFor(role).mode === 'model' ? backgroundFor(role).applied?.params || {} : {}))}${backgroundFor(role).mode === 'model' && backgroundFor(role).applied ? `<br>模型记录：${esc(backgroundFor(role).applied.key)}<br>处理区域（原图 px）：${esc(JSON.stringify(backgroundFor(role).applied.region))}` : ''}<br>图像：${esc(img?.filename || '未导入')}<br>选区状态：${roi?.confirmed ? '已人工确认' : '未确认'}<br>SHA-256：${esc(img?.sha256 || '—')}${img?.originalUrl ? `<br><a href="${esc(img.originalUrl)}" target="_blank" rel="noopener">查看保存的原始图像</a>` : ''}</div></div>`;
     }).join('')}</div>${row?.warnings?.length ? `<div class="result-warnings" style="padding:0 0 15px">${row.warnings.map(w => esc(w)).join('<br>')}</div>` : ''}</details><details class="details-section"><summary>实验备注与来源说明${icon('down')}</summary><textarea class="notes-input" id="experiment-notes" placeholder="记录样本来源、两块膜的对应关系、曝光条件或截图来源。">${esc(active().notes || '')}</textarea></details>`;
   }
   function experimentPage() {
     const exp = active(), checked = exp.samples.filter(s => roles.every(role => roiFor(role,s.id)?.confirmed)).length;
     return `<div class="page-heading"><div><div class="eyebrow">EXPERIMENT / ${esc(exp.id.slice(-8).toUpperCase())}</div><div class="heading-edit"><h1>${esc(exp.name)}</h1><button class="icon-button" data-action="rename" aria-label="编辑实验名称">${icon('edit')}</button></div><p>逐项核对图像选区、样本配对与背景校正，让结果有据可查。</p></div><div class="progress-summary"><div class="stat"><div class="stat-label">样本</div><div class="stat-value">${String(exp.samples.length).padStart(2,'0')}<span>个</span></div></div><div class="stat"><div class="stat-label">双图配对</div><div class="stat-value">${roles.filter(r => exp.images[r]).length}<span>/ 2</span></div></div><div class="stat"><div class="stat-label">人工确认</div><div class="stat-value green">${String(checked).padStart(2,'0')}<span>/ ${exp.samples.length}</span></div></div></div></div>${steps()}
-      <div class="stage-toolbar"><div><h2 class="section-title">${icon('image')}成对图像工作台</h2><p class="section-subtitle">两张图分别定位，按同一样本编号配对。</p></div><div class="legend"><span><i class="legend-box"></i>条带</span><span><i class="legend-box selected"></i>当前样本</span><span><i class="legend-box background"></i>背景</span></div></div><div class="image-grid">${roles.map(imageCard).join('')}</div><div class="image-instructions"><span><b>操作</b>　圈选整排目标区域 → 自动建议 → 点击条带或表格检查 → 确认</span><span>所有坐标均为原图像素 · 缩放只影响显示</span></div><div class="bottom-grid">${resultsPanel()}${inspector()}</div>${measurementDetails()}<div class="bottom-note"><span>${icon('shield')}本地测量 · 原图不可变保存 · 修改有记录</span><span>WB Workbench / v1.0 · ${shortDate(exp.updatedAt || exp.createdAt)} 更新</span></div>`;
+      <div class="stage-toolbar"><div><h2 class="section-title">${icon('image')}成对图像工作台</h2><p class="section-subtitle">两张图分别定位，按同一样本编号配对。</p></div><div class="legend"><span><i class="legend-box"></i>条带</span><span><i class="legend-box selected"></i>当前样本</span><span><i class="legend-box background"></i>背景</span></div></div><div class="image-grid">${roles.map(imageCard).join('')}</div><div class="image-instructions"><span><b>操作</b>　圈选整排目标区域 → 自动建议 → 点击条带或表格检查 → 确认</span><span>所有坐标均为原图像素 · 缩放只影响显示</span></div><div class="bottom-grid">${resultsPanel()}${inspector()}</div>${measurementDetails()}<div class="bottom-note"><span>${icon('shield')}本地测量 · 原图不可变保存 · 修改有记录</span><span>WB Workbench / v1.1.0-dev · ${shortDate(exp.updatedAt || exp.createdAt)} 更新</span></div>`;
   }
   function render() {
     const detailsOpen = $('#measurement-details')?.open;
-    app.innerHTML = `<div class="app-shell">${sidebar()}<div class="workspace">${topbar()}<main class="page">${state.error ? `<div class="error-banner"><span>${icon('warning')} ${esc(state.error)}</span><button class="button small" data-action="retry">${icon('refresh')}重新读取</button></div>` : ''}${active() ? experimentPage() : emptyPage()}</main></div></div>`;
+    app.innerHTML = `<div class="app-shell">${sidebar()}<div class="workspace">${topbar()}<div class="dev-banner"><strong>开发版 / 背景校正功能测试</strong><span>WB Workbench v1.1.0-dev · 独立实验副本 · 非正式版</span></div><main class="page">${state.error ? `<div class="error-banner"><span>${icon('warning')} ${esc(state.error)}</span><button class="button small" data-action="retry">${icon('refresh')}重新读取</button></div>` : ''}${active() ? experimentPage() : emptyPage()}</main></div></div>`;
     if (detailsOpen && $('#measurement-details')) $('#measurement-details').open = true;
     showSaveStatus();
     setupCanvases();
@@ -224,7 +267,8 @@
   function imageFor(role) {
     const metadata = active()?.images[role];
     if (!metadata) return null;
-    const key = metadata.previewUrl;
+    const source = backgroundView(role), preview = backgroundPreview(role);
+    const key = source === 'background' ? preview.backgroundUrl : source === 'corrected' ? preview.correctedUrl : metadata.previewUrl;
     if (!imageCache.has(key)) {
       const image = new Image();
       const item = {image,ready:false,error:false};
@@ -419,7 +463,7 @@
     });
   }
   function exportDialog() {
-    openDialog('导出可复核记录',`<div class="field"><label for="export-scope">导出范围</label><select id="export-scope"><option value="current"${active()?'':' disabled'}>当前实验${active()?` · ${esc(active().name)}`:''}</option><option value="all">全部实验 · ${state.experiments.length} 次</option></select></div><div class="field"><label for="export-format">文件类型</label><select id="export-format"><option value="zip">完整记录包 ZIP · 表格、原图、标记图、操作记录</option><option value="xlsx">Excel 工作簿 XLSX · 含测量与来源明细</option><option value="csv">CSV 数据表 · 含测量与来源明细</option></select></div><div class="dialog-note">未确认或无有效对照的结果会保留状态说明，数值保持空白。多个实验分别使用自己的对照；合并导出不会跨实验借用对照。</div>`,`${cancelButton}<button class="button primary" type="submit">${icon('download')}下载文件</button>`,async()=>{
+    openDialog('导出可复核记录',`<div class="field"><label for="export-scope">导出范围</label><select id="export-scope"><option value="current"${active()?'':' disabled'}>当前实验${active()?` · ${esc(active().name)}`:''}</option><option value="all">全部实验 · ${state.experiments.length} 次</option></select></div><div class="field"><label for="export-format">文件类型</label><select id="export-format"><option value="zip">完整记录包 ZIP · 表格、原图、背景派生结果、操作记录</option><option value="xlsx">Excel 工作簿 XLSX · 含测量与来源明细</option><option value="csv">CSV 数据表 · 含测量与来源明细</option></select></div><div class="dialog-note">未确认或无有效对照的结果会保留状态说明，数值保持空白。多个实验分别使用自己的对照；合并导出不会跨实验借用对照。</div>`,`${cancelButton}<button class="button primary" type="submit">${icon('download')}下载文件</button>`,async()=>{
       const scope=$('#export-scope').value,format=$('#export-format').value;
       const params=new URLSearchParams({format});if(scope==='current' && uid())params.set('experiment',uid());
       const button=$('#dialog-form button[type="submit"]');button.disabled=true;button.textContent='正在生成…';
@@ -437,7 +481,7 @@
     });
   }
   function showMethod() {
-    openDialog('计算方法与适用边界',`<div class="method-body"><h3>1 / 像素测量</h3><p>在原始图像数值上测量，预览缩放不参与计算。暗条带：<code>净信号 = 条带面积 × 背景均值 − 条带像素和</code>；亮条带方向相反。背景框须与条带框分离，并代表局部背景。</p><h3>2 / 配对与实验内归一化</h3><p>同一样本的磷酸化净信号除以对应总蛋白净信号，得到 p/total 图像信号比。再除以本实验所有指定对照的有效比值的算术均值，得到相对对照指标。仅在双图选区已确认且测量有效时发布比值。</p><h3>3 / 保留不确定性</h3><ul><li>净信号非正、框超界或背景与条带重叠，需修正后确认。</li><li>任一指定对照尚未就绪时，相对值暂不发布。</li><li>像素达到数字范围端点是复核提示，不能据此证明仪器检测已经饱和。</li><li>截图、JPEG 压缩、未知曝光和图像处理历史影响定量适用性，软件不能从图片恢复这些实验事实。</li><li>跨膜 p/total 不能单独证明上样量或转膜差异已经得到控制。</li></ul><h3>4 / 自动建议的范围</h3><p>根据你圈定的区域和指定泳道数建议选区。软件不能识别蛋白身份，也不会把自动建议当作人工确认。请逐个检查条带与背景；必要时拖动或输入坐标调整。</p><h3>5 / 本地保存</h3><p>实验和原始图像保存在本机服务的数据目录。浏览器刷新后会从服务恢复；导出的完整 ZIP 包保留计算依据。文件导入后不改写桌面上的原图。</p></div>`,`<button type="button" class="button primary" data-action="close-dialog">了解</button>`);
+    openDialog('计算方法与适用边界',`<div class="method-body"><h3>1 / 像素测量</h3><p>在原始图像数值上测量，预览缩放不参与计算。暗条带：<code>净信号 = 条带面积 × 背景均值 − 条带像素和</code>；亮条带方向相反。背景框须与条带框分离，并代表局部背景。</p><h3>新增模式 B / 背景模型（仅开发版）</h3><p>分析区域内，用稳健二次曲面估计背景 B。暗条带计算 <code>Σ(B − I)</code>；亮条带计算 <code>Σ(I − B)</code>。保留原始强度单位和负值，旧背景框不再参与扣除。原方法 A 仍是默认；只有明确点击“应用于定量”才切换。预览、显示映射、缩放均不进入定量链路。</p><p>clipSigma 是迭代剔除残差阈值，以 MAD 稳健尺度的倍数表示，范围 1–6。该方法不等同于 ImageJ rolling ball；宽条带、密集信号或突变背景可能误扣真实信号。模型不恢复截图损失、采集饱和或未知处理历史。</p><h3>2 / 配对与实验内归一化</h3><p>同一样本的磷酸化净信号除以对应总蛋白净信号，得到 p/total 图像信号比。再除以本实验所有指定对照的有效比值的算术均值，得到相对对照指标。仅在双图选区已确认且测量有效时发布比值。</p><h3>3 / 保留不确定性</h3><ul><li>净信号非正、框超界，或原方法 A 的背景与条带重叠，需修正后确认。模型方法中条带须位于处理区域内。</li><li>任一指定对照尚未就绪时，相对值暂不发布。</li><li>像素达到数字范围端点是复核提示，不能据此证明仪器检测已经饱和。</li><li>截图、JPEG 压缩、未知曝光和图像处理历史影响定量适用性，软件不能从图片恢复这些实验事实。</li><li>跨膜 p/total 不能单独证明上样量或转膜差异已经得到控制。</li></ul><h3>4 / 自动建议的范围</h3><p>根据你圈定的区域和指定泳道数建议选区。软件不能识别蛋白身份，也不会把自动建议当作人工确认。请逐个检查条带与背景；必要时拖动或输入坐标调整。</p><h3>5 / 本地保存</h3><p>实验和原始图像保存在本机服务的数据目录。浏览器刷新后会从服务恢复；导出的完整 ZIP 包保留计算依据。文件导入后不改写桌面上的原图。</p></div>`,`<button type="button" class="button primary" data-action="close-dialog">了解</button>`);
   }
   async function selectSample(id) {
     state.selectedId=id;state.regionRole=null;render();
@@ -451,7 +495,7 @@
       await updateExperiment(e=>{roles.forEach(role=>{const roi=e.rois[role].find(r=>r.sampleId===state.selectedId);roi.confirmed=true;});},'已确认当前样本的双图选区。');return;
     }
     const skipped=targets.length-eligible.length;
-    openDialog('确认全部有效样本',`<p>即将确认 <strong>${eligible.length} 个样本</strong>的双图选区。请确认你已经逐一核对了样本配对、条带位置和背景区域。</p><div class="dialog-note">${skipped?`${skipped} 个样本存在缺失或无效测量，将保持未确认。`:'所有样本都有成对且有效的测量。'}<br>自动建议本身不代表条带身份或实验条件已被验证。</div>`,`${cancelButton}<button type="submit" class="button primary">${icon('checkCircle')}我已复核，确认 ${eligible.length} 个样本</button>`,async()=>{
+    openDialog('确认全部有效样本',`<p>即将确认 <strong>${eligible.length} 个样本</strong>的双图选区。请确认你已经逐一核对了样本配对、条带位置和当前背景计算方法。</p><div class="dialog-note">${skipped?`${skipped} 个样本存在缺失或无效测量，将保持未确认。`:'所有样本都有成对且有效的测量。'}<br>自动建议本身不代表条带身份或实验条件已被验证。</div>`,`${cancelButton}<button type="submit" class="button primary">${icon('checkCircle')}我已复核，确认 ${eligible.length} 个样本</button>`,async()=>{
       const ids=new Set(eligible.map(s=>s.id));
       const result=await updateExperiment(e=>{roles.forEach(role=>e.rois[role].forEach(roi=>{if(ids.has(roi.sampleId))roi.confirmed=true;}));},`已确认 ${eligible.length} 个样本。`);
       if(result)closeDialog();
@@ -462,7 +506,7 @@
     const target=event.target.closest('[data-action]');if(!target || target.disabled)return;
     const action=target.dataset.action,role=target.dataset.role,value=target.dataset.value;
     if(action==='close-dialog'){closeDialog();return;}
-    if(state.busy && !['method','overlay','zoom'].includes(action)){toast('正在保存上一步，请稍候。');return;}
+    if(state.busy && !['method','overlay','zoom','background-view'].includes(action)){toast('正在保存上一步，请稍候。');return;}
     try {
       switch(action) {
         case 'new':newExperimentDialog();break;
@@ -470,13 +514,32 @@
         case 'method':showMethod();break;
         case 'export':exportDialog();break;
         case 'retry':state.busy=true;try{await refreshState();state.error=null;state.save='saved';}finally{state.busy=false;render();}break;
-        case 'select-experiment':state.activeId=target.dataset.id;state.selectedId=active().samples[0]?.id;state.regionRole=null;state.results=null;roles.forEach(r=>{view[r].zoom=1;view[r].panX=0;view[r].panY=0;view[r].showOverlay=true;});storeActive();render();await getResults();render();break;
+        case 'select-experiment':state.activeId=target.dataset.id;state.selectedId=active().samples[0]?.id;state.regionRole=null;state.results=null;roles.forEach(r=>{view[r].zoom=1;view[r].panX=0;view[r].panY=0;view[r].showOverlay=true;view[r].source='original';});storeActive();render();await getResults();render();break;
         case 'select-sample':await selectSample(target.dataset.id);break;
         case 'sample-prev':case 'sample-next': {const samples=active().samples,index=samples.findIndex(s=>s.id===state.selectedId),next=samples[index+(action==='sample-next'?1:-1)];if(next)await selectSample(next.id);break;}
         case 'upload':$(`#file-${role}`).click();break;
         case 'region':state.regionRole=state.regionRole===role?null:role;view[role].showOverlay=true;render();break;
         case 'suggest':await mutation(()=>api(`/api/experiments/${encodeURIComponent(uid())}/suggest/${role}`,{method:'POST',body:JSON.stringify({region:active().settings[role].region,polarity:active().settings[role].polarity})}),'已生成建议选区。请逐个检查后确认。');break;
         case 'polarity':if(active().settings[role].polarity!==value)await updateExperiment(e=>{e.settings[role].polarity=value;e.rois[role].forEach(roi=>{roi.confirmed=false;});},'信号模式已更新；此图选区需重新确认。');break;
+        case 'background-view':view[role].source=value;render();break;
+        case 'background-preview': {
+          const clipSigma=Number(backgroundDraft(role));
+          if(!Number.isFinite(clipSigma) || clipSigma<1 || clipSigma>6){toast('clipSigma 必须是 1–6 之间的有限数值。',true);break;}
+          const result=await mutation(()=>api(`/api/experiments/${encodeURIComponent(uid())}/background/${role}`,{method:'POST',body:JSON.stringify({action:'preview',params:{clipSigma}})}),'背景预览已生成。正式结果及确认状态未改变。');
+          if(result){view[role].source='corrected';render();}
+          break;
+        }
+        case 'background-apply': {
+          if(!backgroundCanApply(role)){toast('请先使用当前参数生成预览，再应用于定量。',true);break;}
+          const key=backgroundPreview(role).key;
+          await mutation(()=>api(`/api/experiments/${encodeURIComponent(uid())}/background/${role}`,{method:'POST',body:JSON.stringify({action:'apply',key})}),'已应用背景模型。此图选区须重新确认，相关比值暂不发布。');
+          break;
+        }
+        case 'background-restore': {
+          const result=await mutation(()=>api(`/api/experiments/${encodeURIComponent(uid())}/background/${role}`,{method:'POST',body:JSON.stringify({action:'restore'})}),'已恢复原局部背景框方法。请核对旧背景框并重新确认。');
+          if(result){view[role].source='original';render();}
+          break;
+        }
         case 'overlay':view[role].showOverlay=!view[role].showOverlay;render();break;
         case 'zoom':view[role].zoom=value==='fit'?1:Math.max(.5,Math.min(8,view[role].zoom*(value==='in'?1.25:.8)));if(value==='fit'){view[role].panX=0;view[role].panY=0;}drawCanvas(role);{const hint=$(`canvas[data-role="${role}"]`).parentNode.querySelector('.canvas-hint');if(hint && !state.regionRole)hint.textContent=view[role].zoom>1?'选区可拖动 · Shift + 拖动平移图像':'选区可拖动 · 拖动边角调整大小';}break;
         case 'roi-kind':view[role].kind=value;view[role].showOverlay=true;render();break;
@@ -485,6 +548,15 @@
         case 'rename':openDialog('编辑实验名称',`<div class="field"><label for="rename-experiment">实验名称</label><input id="rename-experiment" value="${esc(active().name)}" maxlength="120" required></div>`,`${cancelButton}<button type="submit" class="button primary">保存名称</button>`,async()=>{const name=$('#rename-experiment').value.trim();if(!name)return;const result=await updateExperiment(e=>{e.name=name;},'实验名称已保存。');if(result)closeDialog();});break;
       }
     } catch(error){state.error=error.message;toast(error.message,true);render();}
+  });
+  document.addEventListener('input',event=>{
+    const el=event.target;
+    if(!el.matches('.background-sigma'))return;
+    const role=el.dataset.role;
+    backgroundDrafts.set(`${uid()}:${role}`,el.value);
+    const button=$(`[data-action="background-apply"][data-role="${role}"]`), note=$(`#background-draft-${role}`), preview=backgroundPreview(role);
+    if(button)button.disabled=!backgroundCanApply(role);
+    if(note)note.textContent=preview ? `最近预览参数：${preview.params.clipSigma}。${Number(el.value) !== preview.params.clipSigma ? '输入参数已变化，须重新预览后才能应用。' : '预览只用于查看；正式定量方法见上方。'}` : '当前输入为草稿。圈定分析区域后，先预览再决定是否应用。';
   });
   document.addEventListener('change',async event=>{
     const el=event.target;
@@ -498,7 +570,7 @@
           const data=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=()=>reject(new Error('无法读取所选文件。'));reader.readAsDataURL(file);});
           return api(`/api/experiments/${encodeURIComponent(uid())}/images/${role}`,{method:'POST',body:JSON.stringify({filename:file.name,data})});
         },`${roleNames[role]}图已导入，原始文件已保留。`);
-        if(result){view[role].zoom=1;view[role].panX=0;view[role].panY=0;view[role].showOverlay=true;state.regionRole=null;closeDialog();render();}
+        if(result){view[role].zoom=1;view[role].panX=0;view[role].panY=0;view[role].showOverlay=true;view[role].source='original';state.regionRole=null;closeDialog();render();}
       };
       if(active().images[role])openDialog(`替换${roleNames[role]}图`, `<p>新图像：<strong>${esc(file.name)}</strong></p><div class="dialog-note">此实验当前图像的条带框、背景框及确认状态将被清除，需要重新定位。已保存的原图仍保留在本地数据目录。</div>`,`${cancelButton}<button type="submit" class="button primary">替换图像</button>`,performUpload);else await performUpload();
     } else if(el.matches('[data-field]')) {

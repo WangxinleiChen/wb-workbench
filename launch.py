@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Open this copy of the local workbench, reusing its running server if possible."""
+"""Fixed-port development entry; never reuse a Standard process or data path."""
 import json
+import os
 from pathlib import Path
-import socket
-import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -12,27 +11,21 @@ import webbrowser
 
 def main():
     root = Path(__file__).resolve().parent
-    data = str(root / "data")
-    for port in range(8765, 8785):
-        url = f"http://127.0.0.1:{port}"
-        try:
-            with urllib.request.urlopen(url + "/api/health", timeout=0.5) as response:
-                health = json.load(response)
-            if health.get("application") == "WBWorkbench" and health.get("dataDir") == data:
-                print(f"已打开本地工作台：{url}", flush=True)
-                webbrowser.open(url)
-                return 0
-        except (OSError, ValueError, urllib.error.URLError):
-            pass
-        try:
-            with socket.socket() as probe:
-                probe.bind(("127.0.0.1", port))
-        except OSError:
-            continue
-        return subprocess.call([sys.executable, str(root / "server.py"), "--port", str(port), "--open"])
-    print("本地端口 8765–8784 均不可用。请关闭旧服务，或用 server.py --port 指定其他端口。")
-    return 1
+    data = root / 'data'
+    url = 'http://127.0.0.1:8766'
+    print('WB Workbench v1.1.0-dev · 开发版 / 背景校正功能测试', flush=True)
+    try:
+        with urllib.request.urlopen(url + '/api/health', timeout=1) as response:
+            health = json.load(response)
+        if health.get('application') != 'WBWorkbenchDev' or health.get('dataDir') != str(data):
+            raise SystemExit('8766 已被其他服务占用；未连接或停止其他服务。')
+        webbrowser.open(url)
+        return 0
+    except (OSError, ValueError, urllib.error.URLError):
+        pass
+    os.chdir(root)
+    os.execv(sys.executable, [sys.executable, str(root / 'server.py'), '--port', '8766', '--data-dir', str(data), '--open', '--verbose'])
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())

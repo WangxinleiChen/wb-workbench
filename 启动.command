@@ -1,15 +1,10 @@
 #!/bin/zsh
 set -eu
 cd -- "${0:A:h}"
-
-for wb_python in "$PWD/.venv/bin/python3" \
-  "$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3" \
-  /opt/homebrew/bin/python3 /usr/bin/python3; do
-  if [[ -x "$wb_python" ]] && "$wb_python" -c 'import numpy, PIL' 2>/dev/null; then
-    exec "$wb_python" launch.py
-  fi
-done
-
-print '未找到含 NumPy 和 Pillow 的 Python。请按 README.md 中的便携安装步骤准备环境。'
-print '没有自动安装任何软件。按回车关闭。'
-read wb_reply
+print '开发版 / 背景校正功能测试 · v1.1.0-dev · 端口 8766'
+if [[ ! -x "$PWD/.venv/bin/python3" ]]; then
+  print '开发版独立环境缺失。请按开发说明恢复；不会借用标准版环境。'
+  exit 1
+fi
+mkdir -p "$PWD/logs"
+exec "$PWD/.venv/bin/python3" launch.py 2>> "$PWD/logs/server-errors.log"
