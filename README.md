@@ -96,3 +96,10 @@ python3 -m venv .venv
 开发测试：`python3 -m unittest discover -s tests -v`。部分导出核对测试使用 openpyxl，仅为测试依赖；应用导出 XLSX 本身使用标准库。测试检查数值和软件流程，并不构成仪器采集或生物学定量验证。
 
 更新源码前备份 `data/`。卸载本软件可移走本目录；要保留实验请先保留 `data/` 和导出归档。软件未写入全局技能目录或项目规范。
+
+## 许可
+
+[MIT License](LICENSE) · Copyright (c) 2026 Wangxinlei Chen
+
+软件按「现状」提供，不含任何担保。定量结果的科学解释与适用性由使用者自行判断；
+README 中关于图像来源、线性范围与跨膜可比性的限制说明同样适用。
