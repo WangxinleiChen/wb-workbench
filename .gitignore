@@ -1,0 +1,9 @@
+data/
+__pycache__/
+.venv/
+*.pyc
+examples/
+logs/
+exports/
+cache/
+.DS_Store
